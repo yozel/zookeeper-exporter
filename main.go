@@ -63,67 +63,44 @@ type Options struct {
 	ClientCert *tls.Certificate
 }
 
-const cmdNotExecutedSffx = "is not executed because it is not in the whitelist."
-
 var versionRE = regexp.MustCompile(`^([0-9]+\.[0-9]+\.[0-9]+).*$`)
 
 var metricNameReplacer = strings.NewReplacer("-", "_", ".", "_")
 
-func dial(host string, timeout time.Duration, clientCert *tls.Certificate) (net.Conn, error) {
-	dialer := net.Dialer{Timeout: timeout}
-	if clientCert == nil {
-		return dialer.Dial("tcp", host)
-	} else {
-		return tls.DialWithDialer(&dialer, "tcp", host, &tls.Config{
-			Certificates:       []tls.Certificate{*clientCert},
-			InsecureSkipVerify: true,
-		})
-	}
-}
-
 // open tcp connections to zk nodes, send 'mntr' and return result as a map
 func getMetrics(options *Options) map[string]string {
 	metrics := map[string]string{}
-	timeout := time.Duration(options.Timeout) * time.Second
 
 	for _, h := range options.Hosts {
-		tcpaddr, err := net.ResolveTCPAddr("tcp", h)
-		if err != nil {
-			log.Printf("warning: cannot resolve zk hostname '%s': %s", h, err)
-			continue
-		}
-
 		hostLabel := fmt.Sprintf("zk_host=%q", h)
 		zkUp := fmt.Sprintf("zk_up{%s}", hostLabel)
+		zkRuok := fmt.Sprintf("zk_ruok{%s}", hostLabel)
+		metrics[zkUp] = "0"
+		metrics[zkRuok] = "0"
 
-		conn, err := dial(tcpaddr.String(), timeout, options.ClientCert)
-		if err != nil {
-			log.Printf("warning: cannot connect to %s: %v", h, err)
-			metrics[zkUp] = "0"
+		res, err := sendZookeeperCmd(h, "ruok", options)
+		if err != nil || res[0] != "imok" {
+			log.Print(err)
 			continue
 		}
 
-		res := sendZookeeperCmd(conn, h, "mntr")
+		metrics[zkUp] = "1"
+		metrics[zkRuok] = "1"
 
-		// get slice of strings from response, like 'zk_avg_latency 0'
-		lines := strings.Split(res, "\n")
+		res, err = sendZookeeperCmd(h, "mntr", options)
+		if err != nil {
+			log.Print(err)
+			continue
+		}
 
 		// skip instance if it in a leader only state and doesnt serving client requets
-		if lines[0] == "This ZooKeeper instance is not currently serving requests" {
-			metrics[zkUp] = "1"
+		if res[0] == "This ZooKeeper instance is not currently serving requests" {
 			metrics[fmt.Sprintf("zk_server_leader{%s}", hostLabel)] = "1"
 			continue
 		}
 
-		// 'mntr' command isn't allowed in zk config, log as a warning
-		if strings.Contains(lines[0], cmdNotExecutedSffx) {
-			metrics[zkUp] = "0"
-			logNotAllowed("mntr", hostLabel)
-			continue
-		}
-
 		// split each line into key-value pair
-		for _, l := range lines {
+		for _, l := range res {
 			l = strings.Replace(l, "\t", " ", -1)
 			kv := strings.Split(l, " ")
 
@@ -150,46 +127,53 @@ func getMetrics(options *Options) map[string]string {
 				metrics[fmt.Sprintf("%s{%s}", metricNameReplacer.Replace(kv[0]), hostLabel)] = kv[1]
 			}
 		}
-
-		zkRuok := fmt.Sprintf("zk_ruok{%s}", hostLabel)
-		if conn, err := dial(tcpaddr.String(), timeout, options.ClientCert); err == nil {
-			res = sendZookeeperCmd(conn, h, "ruok")
-			if res == "imok" {
-				metrics[zkRuok] = "1"
-			} else {
-				if strings.Contains(res, cmdNotExecutedSffx) {
-					logNotAllowed("ruok", hostLabel)
-				}
-				metrics[zkRuok] = "0"
-			}
-		} else {
-			metrics[zkRuok] = "0"
-		}
-
-		metrics[zkUp] = "1"
 	}
 
 	return metrics
 }
 
-func logNotAllowed(cmd, label string) {
-	log.Printf("warning: %s command isn't allowed at %s, see '4lw.commands.whitelist' ZK config parameter", cmd, label)
+func dial(host string, timeout time.Duration, clientCert *tls.Certificate) (net.Conn, error) {
+	tcpaddr, err := net.ResolveTCPAddr("tcp", host)
+	if err != nil {
+		return nil, fmt.Errorf("warning: cannot resolve zk hostname '%s': %s", host, err)
+	}
+	dialer := net.Dialer{Timeout: timeout}
+	if clientCert == nil {
+		return dialer.Dial("tcp", tcpaddr.String())
+	} else {
+		return tls.DialWithDialer(&dialer, "tcp", tcpaddr.String(), &tls.Config{
+			Certificates:       []tls.Certificate{*clientCert},
+			InsecureSkipVerify: true,
+		})
+	}
 }
 
-func sendZookeeperCmd(conn net.Conn, host, cmd string) string {
+func sendZookeeperCmd(host, cmd string, options *Options) ([]string, error) {
+	timeout := time.Duration(options.Timeout) * time.Second
+	conn, err := dial(host, timeout, options.ClientCert)
+	if err != nil {
+		return nil, fmt.Errorf("warning: cannot connect to %s: %v", host, err)
+	}
 	defer conn.Close()
 
-	_, err := conn.Write([]byte(cmd))
+	_, err = conn.Write([]byte(cmd))
 	if err != nil {
-		log.Printf("warning: failed to send '%s' to '%s': %s", cmd, host, err)
+		return nil, fmt.Errorf("warning: failed to send '%s' to '%s': %s", cmd, host, err)
 	}
 
 	res, err := ioutil.ReadAll(conn)
 	if err != nil {
-		log.Printf("warning: failed read '%s' response from '%s': %s", cmd, host, err)
+		return nil, fmt.Errorf("warning: failed read '%s' response from '%s': %s", cmd, host, err)
+	}
+	if len(res) == 0 {
+		return nil, fmt.Errorf("warning: empty '%s' response from '%s'", cmd, host)
 	}
 
-	return string(res)
+	lines := strings.Split(string(res), "\n")
+	if strings.Contains(lines[0], "is not executed because it is not in the whitelist.") {
+		return nil, fmt.Errorf("warning: %s command isn't allowed at %s, see '4lw.commands.whitelist' ZK config parameter", cmd, host)
+	}
+	return lines, nil
 }
 
 // serve zk metrics at chosen address and url
